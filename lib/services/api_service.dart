@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 
 class ApiService {
   // Render Hosted Backend URL
-  static const String baseUrl = 'https://notemakingapp-ixhe.onrender.com/api';
+  static const String baseUrl = 'https://notemakingapp-4uwp.onrender.com/api';
 
   // REGISTER
   static Future<Map<String, dynamic>> register({
