@@ -13,30 +13,64 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/notes_
 app.use(cors());
 app.use(express.json());
 
-// In-memory persistent fallback if local MongoDB service is stopped
-let memoryUsers = [];
-let memoryNotes = [];
-let isMongoConnected = false;
+// Helper function to safely mask MongoDB URI in logs
+function getMaskedUri(uri) {
+  try {
+    return uri.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
+  } catch {
+    return '[masked]';
+  }
+}
 
-// Attempt MongoDB connection
+// Connection event listeners
+mongoose.connection.on('connected', () => {
+  const host = mongoose.connection.host || 'unknown';
+  const dbName = mongoose.connection.name || 'notes_app';
+  console.log(`✅ Connected to MongoDB successfully! Host: ${host}, Database: ${dbName}`);
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('❌ MongoDB connection error:', err.message);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.warn('⚠️ MongoDB connection lost/disconnected.');
+});
+
+// Attempt MongoDB connection with 15000ms timeout
+console.log(`📡 Connecting to MongoDB: ${getMaskedUri(MONGODB_URI)}`);
 mongoose
-  .connect(MONGODB_URI, { serverSelectionTimeoutMS: 2000 })
-  .then(() => {
-    isMongoConnected = true;
-    console.log(' Connected to MongoDB successfully!');
+  .connect(MONGODB_URI, {
+    dbName: 'notes_app',
+    serverSelectionTimeoutMS: 15000,
   })
   .catch((err) => {
-    isMongoConnected = false;
-    console.log('⚠️ MongoDB server is not currently running. Switched to high-availability in-memory database fallback so app works seamlessly!');
+    console.error('❌ Initial MongoDB connection failed:', err.message);
   });
 
-// Health check
+// Database availability middleware: rejects requests with 503 if DB is not connected
+const requireDb = (req, res, next) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({
+      error: 'Database unavailable. Service is temporarily offline.',
+    });
+  }
+  next();
+};
+
+// Health check endpoint (always accessible)
 app.get('/', (req, res) => {
+  const isConnected = mongoose.connection.readyState === 1;
   res.json({
     status: 'running',
-    storage: isMongoConnected ? 'MongoDB (Local/Atlas)' : 'Embedded Memory DB',
+    database: isConnected ? 'connected' : 'disconnected',
+    host: isConnected ? mongoose.connection.host : null,
+    dbName: isConnected ? mongoose.connection.name : null,
   });
 });
+
+// Apply database readiness check to all API routes
+app.use('/api', requireDb);
 
 // AUTH: Register
 app.post('/api/auth/register', async (req, res) => {
@@ -46,41 +80,33 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
 
-    if (isMongoConnected) {
-      const existingUser = await User.findOne({ email });
-      if (existingUser) {
-        return res.status(400).json({ error: 'Email already registered' });
-      }
-
-      const user = new User({ name, email, password });
-      await user.save();
-
-      return res.status(201).json({
-        message: 'Account registered successfully',
-        user: { id: user._id.toString(), name: user.name, email: user.email },
-      });
-    } else {
-      // In-memory fallback
-      const existingUser = memoryUsers.find((u) => u.email.toLowerCase() === email.toLowerCase());
-      if (existingUser) {
-        return res.status(400).json({ error: 'Email already registered' });
-      }
-
-      const newUser = {
-        id: Date.now().toString(),
-        name,
-        email,
-        password,
-      };
-      memoryUsers.push(newUser);
-
-      return res.status(201).json({
-        message: 'Account registered successfully',
-        user: { id: newUser.id, name: newUser.name, email: newUser.email },
-      });
+    const cleanEmail = email.toLowerCase().trim();
+    const existingUser = await User.findOne({ email: cleanEmail });
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already registered' });
     }
+
+    const user = new User({
+      name: name.trim(),
+      email: cleanEmail,
+      password,
+    });
+
+    await user.save();
+
+    return res.status(201).json({
+      message: 'Account registered successfully',
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -92,31 +118,22 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    if (isMongoConnected) {
-      const user = await User.findOne({ email });
-      if (!user || user.password !== password) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
-
-      return res.json({
-        message: 'Login successful',
-        user: { id: user._id.toString(), name: user.name, email: user.email },
-      });
-    } else {
-      const user = memoryUsers.find(
-        (u) => u.email.toLowerCase() === email.toLowerCase() && u.password === password
-      );
-      if (!user) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
-
-      return res.json({
-        message: 'Login successful',
-        user: { id: user.id, name: user.name, email: user.email },
-      });
+    const cleanEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: cleanEmail });
+    if (!user || user.password !== password) {
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
+
+    return res.json({
+      message: 'Login successful',
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -128,17 +145,14 @@ app.get('/api/notes', async (req, res) => {
       return res.status(400).json({ error: 'userId parameter is required' });
     }
 
-    if (isMongoConnected) {
-      const notes = await Note.find({ userId }).sort({ date: -1, createdAt: -1 });
-      return res.json(notes);
-    } else {
-      const userNotes = memoryNotes
-        .filter((n) => n.userId === userId)
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
-      return res.json(userNotes);
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: 'Invalid userId format' });
     }
+
+    const notes = await Note.find({ userId }).sort({ date: -1, createdAt: -1 });
+    return res.json(notes);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -150,98 +164,71 @@ app.post('/api/notes', async (req, res) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    if (isMongoConnected) {
-      const note = new Note({
-        userId,
-        title: title || 'Untitled Note',
-        content: content || '',
-        date: date ? new Date(date) : new Date(),
-        colorValue: colorValue || 0xFFEEF2FF,
-      });
-
-      await note.save();
-      return res.status(201).json(note);
-    } else {
-      const newNote = {
-        _id: Date.now().toString(),
-        userId,
-        title: title || 'Untitled Note',
-        content: content || '',
-        date: date ? new Date(date) : new Date(),
-        colorValue: colorValue || 0xFFEEF2FF,
-      };
-      memoryNotes.unshift(newNote);
-      return res.status(201).json(newNote);
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: 'Invalid userId format' });
     }
+
+    const note = new Note({
+      userId,
+      title: title || 'Untitled Note',
+      content: content || '',
+      date: date ? new Date(date) : new Date(),
+      colorValue: colorValue !== undefined ? colorValue : 0xFFEEF2FF,
+    });
+
+    await note.save();
+    return res.status(201).json(note);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
 // NOTES: Update note
 app.put('/api/notes/:id', async (req, res) => {
   try {
-    const { title, content, date, colorValue } = req.body;
+    const { title, content, date, colorValue, userId } = req.body;
 
-    if (isMongoConnected) {
-      const note = await Note.findByIdAndUpdate(
-        req.params.id,
-        {
-          title,
-          content,
-          date: date ? new Date(date) : undefined,
-          colorValue,
-        },
-        { new: true }
-      );
-
-      if (!note) {
-        return res.status(404).json({ error: 'Note not found' });
-      }
-
-      return res.json(note);
-    } else {
-      const idx = memoryNotes.findIndex((n) => n._id === req.params.id);
-      if (idx === -1) {
-        return res.status(404).json({ error: 'Note not found' });
-      }
-
-      memoryNotes[idx] = {
-        ...memoryNotes[idx],
-        title: title !== undefined ? title : memoryNotes[idx].title,
-        content: content !== undefined ? content : memoryNotes[idx].content,
-        date: date ? new Date(date) : memoryNotes[idx].date,
-        colorValue: colorValue !== undefined ? colorValue : memoryNotes[idx].colorValue,
-      };
-
-      return res.json(memoryNotes[idx]);
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid note ID' });
     }
+
+    const filter = { _id: req.params.id };
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      filter.userId = userId;
+    }
+
+    const updateData = {};
+    if (title !== undefined) updateData.title = title;
+    if (content !== undefined) updateData.content = content;
+    if (date !== undefined) updateData.date = new Date(date);
+    if (colorValue !== undefined) updateData.colorValue = colorValue;
+
+    const note = await Note.findOneAndUpdate(filter, updateData, { new: true });
+    if (!note) {
+      return res.status(404).json({ error: 'Note not found' });
+    }
+
+    return res.json(note);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
 // NOTES: Delete note
 app.delete('/api/notes/:id', async (req, res) => {
   try {
-    if (isMongoConnected) {
-      const note = await Note.findByIdAndDelete(req.params.id);
-      if (!note) {
-        return res.status(404).json({ error: 'Note not found' });
-      }
-
-      return res.json({ message: 'Note deleted successfully', id: req.params.id });
-    } else {
-      const index = memoryNotes.findIndex((n) => n._id === req.params.id);
-      if (index === -1) {
-        return res.status(404).json({ error: 'Note not found' });
-      }
-
-      memoryNotes.splice(index, 1);
-      return res.json({ message: 'Note deleted successfully', id: req.params.id });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid note ID' });
     }
+
+    const note = await Note.findByIdAndDelete(req.params.id);
+    if (!note) {
+      return res.status(404).json({ error: 'Note not found' });
+    }
+
+    return res.json({ message: 'Note deleted successfully', id: req.params.id });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
